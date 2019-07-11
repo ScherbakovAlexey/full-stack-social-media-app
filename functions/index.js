@@ -1,114 +1,210 @@
 const functions = require("firebase-functions");
-const admin = require("firebase-admin");
-const app = require("express")();
-admin.initializeApp();
 
-const firebaseConfig = {
-  apiKey: "AIzaSyBNl_IH3kEp2h6eO9Itzqg95rKsph6dvdA",
-  authDomain: "socialape-35308.firebaseapp.com",
-  databaseURL: "https://socialape-35308.firebaseio.com",
-  projectId: "socialape-35308",
-  storageBucket: "socialape-35308.appspot.com",
-  messagingSenderId: "370018189920",
-  appId: "1:370018189920:web:c45035f778e4fc98"
+const app = require("express")();
+
+const { admin, db } = require("./util/admin");
+
+//const FBAuth = require(".util/fbAuth");
+const fbauth = (req, res, next) => {
+  let idToken;
+  if (
+    req.headers.authorization &&
+    req.headers.authorization.startsWith("Bearer ")
+  ) {
+    idToken = req.headers.authorization.split("Bearer ")[1];
+  } else {
+    console.error("No token found");
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  admin
+    .auth()
+    .verifyIdToken(idToken)
+    .then(decodedToken => {
+      req.user = decodedToken;
+      return db
+        .collection("users")
+        .where("userId", "==", req.user.uid)
+        .limit(1)
+        .get();
+    })
+    .then(data => {
+      req.user.handle = data.docs[0].data().handle;
+      req.user.imageUrl = data.docs[0].data().imageUrl;
+      return next();
+    })
+    .catch(err => {
+      console.error("Error while verifying token", err);
+      return res.status(403).json(err);
+    });
 };
 
-const firebase = require("firebase");
-firebase.initializeApp(firebaseConfig);
+const {
+  getAllScreams,
+  postOneScream,
+  getScream,
+  commentOnScream,
+  likeScream,
+  unlikeScream,
+  deleteScream
+} = require("./handlers/screams");
+const {
+  signup,
+  login,
+  uploadImage,
+  addUserDetails,
+  getAuthenticatedUser,
+  getUserDetails,
+  markNotificationsRead
+} = require("./handlers/users");
 
-const db = admin.firestore();
-
-// // Create and Deploy Your First Cloud Functions
-// // https://firebase.google.com/docs/functions/write-firebase-functions
-//
 exports.helloWorld = functions.https.onRequest((request, response) => {
   response.send("Hello w from Firebase!");
 });
 
-app.get("/screams", (req, res) => {
-  db.collection("screams")
-    .orderBy("createdAt", "desc")
-    .get()
-    .then(data => {
-      let screams = [];
-      data.forEach(doc => {
-        screams.push({
-          screamId: doc.id,
-          body: doc.data().body,
-          userHandle: doc.data().userHandle,
-          createdAt: doc.data().createdAt
-        });
-      });
-      return res.json(screams);
-    })
-    .catch(err => console.error(err));
-});
+// Scream routes
+app.get("/screams", getAllScreams);
+app.post("/scream", fbauth, postOneScream);
+app.get("/scream/:screamId", getScream);
+app.delete("/scream/:screamId", fbauth, deleteScream);
+app.get("/scream/:screamId/like", fbauth, likeScream);
+app.get("/scream/:screamId/unlike", fbauth, unlikeScream);
+app.post("/scream/:screamId/comment", fbauth, commentOnScream);
 
-app.post("/scream", (req, res) => {
-  const newScream = {
-    body: req.body.body,
-    userHandle: req.body.userHandle,
-    createdAt: new Date().toISOString()
-  };
-
-  db.collection("screams")
-    .add(newScream)
-    .then(doc => {
-      res.json({ message: `document ${doc.id} created successfully` });
-    })
-    .catch(err => {
-      res.status(500).json({ error: "something went wrong" });
-      console.error(err);
-    });
-});
-
-// Signup route
-app.post("/signup", (req, res) => {
-  const newUser = {
-    email: req.body.email,
-    password: req.body.password,
-    confirmPassword: req.body.confirmPassword,
-    handle: req.body.handle
-  };
-
-  // todo: validate data
-  let token, userId;
-  db.doc(`/users/${newUser.handle}`)
-    .get()
-    .then(doc => {
-      if (doc.exists) {
-        return res.status(400).json({ handle: "this handle is already taken" });
-      } else {
-        return firebase
-          .auth()
-          .createUserWithEmailAndPassword(newUser.email, newUser.password);
-      }
-    })
-    .then(data => {
-      userId = data.user.uid;
-      return data.user.getIdToken();
-    })
-    .then(idToken => {
-      token = idToken;
-      const userCredentials = {
-        handle: newUser.handle,
-        email: newUser.email,
-        createdAt: new Date().toISOString(),
-        userId: userId
-      };
-      db.doc(`/users/${newUser.handle}`).set(userCredentials);
-    })
-    .then(data => {
-      return res.status(201).json({ token });
-    })
-    .catch(err => {
-      console.error(err);
-      if (err.code === "auth/email-already-in-use") {
-        return res.status(400).json({ email: "Email is already in use" });
-      } else {
-        return res.status(500).json({ error: err.code });
-      }
-    });
-});
+// users routes
+app.post("/signup", signup);
+app.post("/login", login);
+app.post("/user/image", fbauth, uploadImage);
+app.post("/user", fbauth, addUserDetails);
+app.get("/user", fbauth, getAuthenticatedUser);
+app.get("/user/:handle", getUserDetails);
+app.post("/notifications", fbauth, markNotificationsRead);
 
 exports.api = functions.region("europe-west1").https.onRequest(app);
+
+exports.createNotificationOnLike = functions
+  .region("europe-west1")
+  .firestore.document("likes/{id}")
+  .onCreate(snapshot => {
+    return db
+      .doc(`/screams/${snapshot.data().screamId}`)
+      .get()
+      .then(doc => {
+        if (
+          doc.exists &&
+          doc.data().userHandle !== snapshot.data().userHandle
+        ) {
+          return db.doc(`/notifications/${snapshot.id}`).set({
+            createdAt: new Date().toISOString(),
+            recipient: doc.data().userHandle,
+            sender: snapshot.data().userHandle,
+            type: "like",
+            read: false,
+            screamId: doc.id
+          });
+        }
+      })
+      .catch(err => {
+        console.error(err);
+      });
+  });
+
+exports.deleteNotificationOnUnLike = functions
+  .region("europe-west1")
+  .firestore.document("likes/{id}")
+  .onDelete(snapshot => {
+    return db
+      .doc(`/notifications/${snapshot.id}`)
+      .delete()
+      .catch(err => {
+        console.error(err);
+        return;
+      });
+  });
+
+exports.createNotificationOnComment = functions
+  .region("europe-west1")
+  .firestore.document("comments/{id}")
+  .onCreate(snapshot => {
+    return db
+      .doc(`/screams/${snapshot.data().screamId}`)
+      .get()
+      .then(doc => {
+        if (
+          doc.exists &&
+          doc.data().userHandle !== snapshot.data().userHandle
+        ) {
+          return db.doc(`/notifications/${snapshot.id}`).set({
+            createdAt: new Date().toISOString(),
+            recipient: doc.data().userHandle,
+            sender: snapshot.data().userHandle,
+            type: "comment",
+            read: false,
+            screamId: doc.id
+          });
+        }
+      })
+      .catch(err => {
+        console.error(err);
+        return;
+      });
+  });
+
+exports.onUserImageChange = functions
+  .region("europe-west1")
+  .firestore.document("/users/{userId}")
+  .onUpdate(change => {
+    console.log(change.before.data());
+    console.log(change.after.data());
+    if (change.before.data().imageUrl !== change.after.data().imageUrl) {
+      console.log("img changed");
+      let batch = db.batch();
+      return db
+        .collection("screams")
+        .where("userHandle", "==", change.before.data().handle)
+        .get()
+        .then(data => {
+          data.forEach(doc => {
+            const scream = db.doc(`/screams/${doc.id}`);
+            batch.update(scream, { userImage: change.after.data().imageUrl });
+          });
+          return batch.commit();
+        });
+    } else return true;
+  });
+
+exports.onScreamDelete = functions
+  .region("europe-west1")
+  .firestore.document("/screams/{screamId}")
+  .onDelete((snapshot, context) => {
+    const screamId = context.params.screamId;
+    const batch = db.batch();
+    return db
+      .collection("comments")
+      .where("screamId", "==", screamId)
+      .get()
+      .then(data => {
+        data.forEach(doc => {
+          batch.delete(db.doc(`/comments/${doc.id}`));
+        });
+        return db
+          .collection("likes")
+          .where("screamId", "==", screamId)
+          .get();
+      })
+      .then(data => {
+        data.forEach(doc => {
+          batch.delete(db.doc(`/likes/${doc.id}`));
+        });
+        return db
+          .collection("notifications")
+          .where("screamId", "==", screamId)
+          .get();
+      })
+      .then(data => {
+        data.forEach(doc => {
+          batch.delete(db.doc(`/notifications/${doc.id}`));
+        });
+        return batch.commit();
+      })
+      .catch(err => console.error(err));
+  });
